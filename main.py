@@ -2,12 +2,14 @@ import os
 import asyncio
 from collections import defaultdict, deque
 
+from fastapi import FastAPI, Request
 from openai import AsyncOpenAI
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -15,8 +17,7 @@ SYSTEM_PROMPT = """
 Tum Telegram group ki ek friendly female AI member ho.
 
 Hindi/Hinglish me natural aur casual baat karo.
-Feminine wording use karo, jaise:
-"karungi", "bataungi", "samajh gayi".
+Feminine wording use karo, jaise "karungi", "bataungi", "samajh gayi".
 
 Friendly, cute aur confident personality rakho.
 Group ke sabhi members se respectfully baat karo.
@@ -34,10 +35,16 @@ Kisi user ki personal information guess mat karo.
 history = defaultdict(lambda: deque(maxlen=12))
 locks = defaultdict(asyncio.Lock)
 
+bot_app = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .updater(None)
+    .build()
+)
+
 
 async def generate_reply(chat_id, username, text):
     async with locks[chat_id]:
-
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
@@ -76,7 +83,6 @@ async def generate_reply(chat_id, username, text):
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not update.message or not update.message.text:
         return
 
@@ -106,36 +112,44 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("ERROR:", repr(e))
 
 
-async def main():
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
+bot_app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        on_message
     )
+)
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            on_message
-        )
+web_app = FastAPI()
+
+
+@web_app.on_event("startup")
+async def startup():
+    await bot_app.initialize()
+    await bot_app.start()
+
+    await bot_app.bot.set_webhook(
+        url=f"{WEBHOOK_URL}/telegram",
+        allowed_updates=Update.ALL_TYPES
     )
 
     print("Bot is running...")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
 
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+@web_app.on_event("shutdown")
+async def shutdown():
+    await bot_app.bot.delete_webhook()
+    await bot_app.stop()
+    await bot_app.shutdown()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@web_app.get("/")
+async def home():
+    return {"status": "Bot is running"}
+
+
+@web_app.post("/telegram")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.update_queue.put(update)
+    return {"ok": True}
