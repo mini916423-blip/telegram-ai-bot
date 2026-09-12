@@ -1,0 +1,141 @@
+import os
+import asyncio
+from collections import defaultdict, deque
+
+from openai import AsyncOpenAI
+from telegram import Update
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+SYSTEM_PROMPT = """
+Tum Telegram group ki ek friendly female AI member ho.
+
+Hindi/Hinglish me natural aur casual baat karo.
+Feminine wording use karo, jaise:
+"karungi", "bataungi", "samajh gayi".
+
+Friendly, cute aur confident personality rakho.
+Group ke sabhi members se respectfully baat karo.
+User ki baat ka relevant aur natural jawab do.
+Zyada formal ya robotic mat lagna.
+
+Replies short aur human-like rakho, usually 1-4 lines.
+Agar message sirf emoji, spam ya bilkul irrelevant ho,
+to [NO_REPLY] likh sakti ho.
+
+Agar koi directly puche ki tum AI/bot ho, to sach batao.
+Kisi user ki personal information guess mat karo.
+"""
+
+history = defaultdict(lambda: deque(maxlen=12))
+locks = defaultdict(asyncio.Lock)
+
+
+async def generate_reply(chat_id, username, text):
+    async with locks[chat_id]:
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+
+        for role, content in history[chat_id]:
+            messages.append({
+                "role": role,
+                "content": content
+            })
+
+        messages.append({
+            "role": "user",
+            "content": f"{username}: {text}"
+        })
+
+        response = await client.responses.create(
+            model="gpt-5-mini",
+            input=messages,
+            max_output_tokens=180
+        )
+
+        answer = (response.output_text or "").strip()
+
+        history[chat_id].append(
+            ("user", f"{username}: {text}")
+        )
+
+        if not answer or answer == "[NO_REPLY]":
+            return ""
+
+        history[chat_id].append(
+            ("assistant", answer)
+        )
+
+        return answer
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not update.message or not update.message.text:
+        return
+
+    if update.message.from_user and update.message.from_user.is_bot:
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user or not chat:
+        return
+
+    username = user.first_name or "User"
+    text = update.message.text.strip()
+
+    try:
+        answer = await generate_reply(
+            chat.id,
+            username,
+            text
+        )
+
+        if answer:
+            await update.message.reply_text(answer)
+
+    except Exception as e:
+        print("ERROR:", repr(e))
+
+
+async def main():
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            on_message
+        )
+    )
+
+    print("Bot is running...")
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
